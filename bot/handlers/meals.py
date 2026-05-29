@@ -89,31 +89,67 @@ async def food_text_received(message: Message, state: FSMContext):
             await message.answer("❌ Produit introuvable avec ce code-barres. Essaie le mode texte !")
             return
 
-    # Mode texte : rechercher dans OpenFoodFacts
-    results = await search_food(message.text)
-    if not results:
+    # Mode texte : parser les aliments individuels
+    import re
+    lines = re.split(r'[,;\n\r]+', message.text.strip())
+    parsed_items = []
+    for line in lines:
+        line = line.strip().lstrip('-*•').strip()
+        if not line:
+            continue
+        m = re.match(r'(\d+)\s*g\s*(?:de|d\'|)\s*(.+)', line)
+        if m:
+            parsed_items.append({"qty": int(m.group(1)), "name": m.group(2).strip()})
+        else:
+            parsed_items.append({"qty": 100, "name": line})
+
+    if not parsed_items:
+        await message.answer("Je n'ai rien compris. Essaie : `300g poulet, 200g riz`")
+        return
+
+    # Chercher chaque aliment un par un
+    meal_foods = []
+    not_found = []
+    for item in parsed_items:
+        results = await search_food(item["name"])
+        if results:
+            food = results[0]
+            qty = item["qty"]
+            meal_foods.append({
+                "name": food["name"],
+                "grams": qty,
+                "kcal": round(food["kcal_per_100g"] * qty / 100, 1),
+                "protein_g": round(food.get("protein_per_100g", 0) * qty / 100, 1),
+                "carbs_g": round(food.get("carbs_per_100g", 0) * qty / 100, 1),
+                "fat_g": round(food.get("fat_per_100g", 0) * qty / 100, 1),
+                "barcode": food.get("barcode"),
+            })
+        else:
+            not_found.append(item["name"])
+
+    if not meal_foods:
         await message.answer(
-            "😕 Je n'ai pas trouvé correspondance. "
+            "😕 Je n'ai trouvé aucun de ces aliments. "
             "Peux-tu être plus précis ? (ex: '150g riz blanc, 200g poulet')"
         )
         return
 
-    # Afficher les résultats
-    kb = InlineKeyboardBuilder()
-    for i, food in enumerate(results[:5]):
-        kb.button(
-            text=f"{food['name']} — {food['kcal_per_100g']:.0f} kcal/100g",
-            callback_data=f"food_{i}",
-        )
-    kb.button(text="🔁 Nouvelle recherche", callback_data="log_text")
-    kb.adjust(1)
+    # Résumé des aliments trouvés
+    total_kcal = sum(f["kcal"] for f in meal_foods)
+    total_protein = sum(f["protein_g"] for f in meal_foods)
+    total_carbs = sum(f["carbs_g"] for f in meal_foods)
+    total_fat = sum(f["fat_g"] for f in meal_foods)
 
-    await state.update_data(food_results=results[:5])
-    await message.answer(
-        "🔍 Voici ce que j'ai trouvé. <b>Clique sur le bon aliment :</b>",
-        reply_markup=kb.as_markup(),
-    )
-    await state.set_state(LogMeal.waiting_for_food)
+    summary = "✅ <b>Aliments reconnus :</b>\n\n"
+    for f in meal_foods:
+        summary += f"• {f['name']} — {f['grams']}g → {f['kcal']} kcal\n"
+    if not_found:
+        summary += f"\n⚠️ Non trouvé(s) : {', '.join(not_found)}\n"
+    summary += f"\n📊 <b>Total estimé :</b> {total_kcal:.0f} kcal | P:{total_protein:.0f}g G:{total_carbs:.0f}g L:{total_fat:.0f}g"
+
+    await state.update_data(meal_foods=meal_foods)
+    await state.set_state(LogMeal.waiting_for_meal_type)
+    await ask_meal_type(message, state, summary)
 
 
 @router.callback_query(F.data.startswith("food_"), LogMeal.waiting_for_food)
@@ -167,15 +203,19 @@ async def custom_quantity(message: Message, state: FSMContext):
     await ask_meal_type(message, state)
 
 
-async def ask_meal_type(message, state: FSMContext):
+async def ask_meal_type(message, state: FSMContext, summary: str = None):
     await state.set_state(LogMeal.waiting_for_meal_type)
     kb = InlineKeyboardBuilder()
     for key, label in MEAL_TYPES.items():
         kb.button(text=label, callback_data=f"mealtype_{key}")
     kb.adjust(2)
 
+    text = "🍽️ <b>C'est quel type de repas ?</b>"
+    if summary:
+        text = summary + "\n\n🍽️ <b>C'est quel type de repas ?</b>"
+
     await message.answer(
-        "🍽️ <b>C'est quel type de repas ?</b>",
+        text,
         reply_markup=kb.as_markup(),
     )
 
@@ -186,37 +226,39 @@ async def meal_type_chosen(callback: CallbackQuery, state: FSMContext):
     meal_type = callback.data.replace("mealtype_", "")
     data = await state.get_data()
 
-    food = data["selected_food"]
-    qty = data["quantity"]
-    kcal = food["kcal_per_100g"] * qty / 100
-    protein = food.get("protein_per_100g", 0) * qty / 100
-    carbs = food.get("carbs_per_100g", 0) * qty / 100
-    fat = food.get("fat_per_100g", 0) * qty / 100
-
-    foods = [{
-        "name": food["name"],
-        "grams": qty,
-        "kcal": round(kcal, 1),
-        "protein_g": round(protein, 1),
-        "carbs_g": round(carbs, 1),
-        "fat_g": round(fat, 1),
-        "barcode": food.get("barcode"),
-    }]
+    # Support multi-aliments (meal_foods) ET mono-aliment (selected_food)
+    foods = data.get("meal_foods")
+    if foods:
+        total_kcal = sum(f["kcal"] for f in foods)
+    else:
+        food = data["selected_food"]
+        qty = data["quantity"]
+        total_kcal = round(food["kcal_per_100g"] * qty / 100, 1)
+        foods = [{
+            "name": food["name"],
+            "grams": qty,
+            "kcal": total_kcal,
+            "protein_g": round(food.get("protein_per_100g", 0) * qty / 100, 1),
+            "carbs_g": round(food.get("carbs_per_100g", 0) * qty / 100, 1),
+            "fat_g": round(food.get("fat_per_100g", 0) * qty / 100, 1),
+            "barcode": food.get("barcode"),
+        }]
 
     await db.log_meal(
         telegram_id=callback.from_user.id,
         meal_type=meal_type,
         foods=foods,
-        total_kcal=round(kcal, 1),
+        total_kcal=round(total_kcal, 1),
     )
 
     today = await db.get_today_summary(callback.from_user.id)
     remaining = max(0, (data.get("daily_goal") or 2000) - (today["calories_consumed"] or 0))
 
+    detail = "\n".join(f"• {f['name']} — {f['grams']}g → {f['kcal']} kcal"
+                       for f in foods)
     await callback.message.edit_text(
-        f"✅ <b>Repas loggé !</b>\n\n"
-        f"{MEAL_TYPES[meal_type]} — <b>{food['name']}</b>\n"
-        f"📊 {qty}g → {kcal:.0f} kcal | P:{protein:.0f}g G:{carbs:.0f}g L:{fat:.0f}g\n\n"
+        f"✅ <b>Repas loggé !</b> ({MEAL_TYPES[meal_type]})\n\n"
+        f"{detail}\n\n"
         f"🔥 <b>Reste aujourd'hui :</b> {remaining:.0f} kcal\n\n"
         f"<i>Continue avec /log ou parle au coach /coach</i>"
     )
