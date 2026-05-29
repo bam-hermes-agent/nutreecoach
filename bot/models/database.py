@@ -3,6 +3,7 @@ NutreeCoach — Modèles et accès base de données (PostgreSQL async)
 """
 
 import os
+import json
 import asyncpg
 from datetime import date, datetime
 from typing import Optional
@@ -121,7 +122,7 @@ class Database:
                        $2, $3, $4::jsonb, $5, $6, $7, $8
                    ) RETURNING *""",
                 telegram_id, meal_type, source,
-                asyncpg.Json(foods),
+                json.dumps(foods),
                 total_kcal, total_protein, total_carbs, total_fat,
             )
 
