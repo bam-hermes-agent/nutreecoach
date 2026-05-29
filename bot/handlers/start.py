@@ -175,7 +175,8 @@ async def activity_chosen(callback: CallbackQuery, state: FSMContext):
 
     protein = round(data["weight"] * 2.0)
     fats = round(daily_cal * 0.25 / 9)
-    carbs = round((daily_cal - protein * 4 - fats * 9) / 4)
+    carbs_cal = daily_cal - (protein * 4 + fats * 9)
+    carbs = max(0, round(carbs_cal / 4))
 
     await db.update_user_goal(
         callback.from_user.id,
