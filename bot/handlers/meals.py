@@ -10,7 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from models.database import db
-from services.food_db import search_food, search_by_barcode
+from services.food_db import search_food, search_by_barcode, parse_meal_with_llm
 
 router = Router()
 
@@ -89,32 +89,24 @@ async def food_text_received(message: Message, state: FSMContext):
             await message.answer("❌ Produit introuvable avec ce code-barres. Essaie le mode texte !")
             return
 
-    # Mode texte : parser les aliments individuels
-    import re
-    lines = re.split(r'[,;\n\r]+', message.text.strip())
-    parsed_items = []
-    for line in lines:
-        line = line.strip().lstrip('-*•').strip()
-        if not line:
-            continue
-        m = re.match(r'(\d+)\s*g\s*(?:de|d\'|)\s*(.+)', line)
-        if m:
-            parsed_items.append({"qty": int(m.group(1)), "name": m.group(2).strip()})
-        else:
-            parsed_items.append({"qty": 100, "name": line})
-
+    # Mode texte : parser les aliments avec DeepSeek
+    await message.answer("🧠 Je parse ton repas...")
+    parsed_items = await parse_meal_with_llm(message.text)
     if not parsed_items:
-        await message.answer("Je n'ai rien compris. Essaie : `300g poulet, 200g riz`")
+        await message.answer(
+            "😕 Je n'ai pas réussi à analyser ton message. "
+            "Essaie : `300g poulet, 200g riz`"
+        )
         return
 
     # Chercher chaque aliment un par un
     meal_foods = []
     not_found = []
     for item in parsed_items:
-        results = await search_food(item["name"])
+        results = await search_food(item["food"])
         if results:
             food = results[0]
-            qty = item["qty"]
+            qty = item["quantity_g"]
             meal_foods.append({
                 "name": food["name"],
                 "grams": qty,
@@ -125,7 +117,7 @@ async def food_text_received(message: Message, state: FSMContext):
                 "barcode": food.get("barcode"),
             })
         else:
-            not_found.append(item["name"])
+            not_found.append(item["food"])
 
     if not meal_foods:
         await message.answer(

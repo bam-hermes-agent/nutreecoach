@@ -2,8 +2,11 @@
 NutreeCoach — Service d'accès aux bases de données alimentaires
 """
 
-import httpx
+import json
 import logging
+import os
+
+import httpx
 from models.database import db
 
 logger = logging.getLogger(__name__)
@@ -139,3 +142,81 @@ async def _fallback_nutrition_search(query: str) -> list[dict]:
             })
 
     return results[:5]
+
+
+async def parse_meal_with_llm(text: str) -> list[dict]:
+    """
+    Utilise DeepSeek pour parser un texte de repas en aliments structurés.
+    Retourne [{\"food\": \"poulet\", \"quantity_g\": 300}, ...]
+    """
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        return _fallback_parse_meal(text)
+
+    prompt = (
+        "Tu aides à parser des descriptions de repas. "
+        "Extrais les aliments et leurs quantités. "
+        "Réponds UNIQUEMENT avec un tableau JSON valide, rien d'autre.\n\n"
+        f'Message: "{text}"\n\n'
+        "Format: [{\"food\": \"nom_aliment\", \"quantity_g\": nombre_en_grammes}]\n\n"
+        "Règles:\n"
+        "- quantity_g est TOUJOURS en grammes (2 oeufs ≈ 100g, 1 filet de poulet ≈ 150g)\n"
+        "- Si pas de quantité, mets 100 par défaut\n"
+        "- Extrais TOUS les aliments listés\n"
+        "- Le nom d'aliment doit être court et générique (ex: 'poulet' pas 'poulet rôti au four')"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {"role": "system", "content": "Tu réponds uniquement en JSON valide, sans aucun commentaire."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 500,
+                },
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"].strip()
+
+            # Nettoyer le JSON (le LLM peut ajouter des ``` markdown)
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+                content = content.rsplit("```", 1)[0].strip()
+
+            items = json.loads(content)
+            if isinstance(items, list):
+                return [
+                    {"food": item["food"], "quantity_g": int(item["quantity_g"])}
+                    for item in items
+                ]
+    except Exception as e:
+        logger.warning(f"LLM meal parsing failed: {e}")
+
+    return _fallback_parse_meal(text)
+
+
+def _fallback_parse_meal(text: str) -> list[dict]:
+    """Fallback regex si l'API DeepSeek est indisponible."""
+    import re
+
+    lines = re.split(r'[,;\n\r]+', text.strip())
+    items = []
+    for line in lines:
+        line = line.strip().lstrip("-*•").strip()
+        if not line:
+            continue
+        m = re.match(r"(\d+)\s*g\s*(?:de|d'|)\s*(.+)", line)
+        if m:
+            items.append({"food": m.group(2).strip(), "quantity_g": int(m.group(1))})
+        else:
+            items.append({"food": line, "quantity_g": 100})
+    return items
