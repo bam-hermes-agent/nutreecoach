@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+
+  # === 1. BOT TELEGRAM (aiogram 3.x) ===
+  bot:
+    image: python:3.13-slim
+    container_name: nutrition-bot
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - hermes-coach
+    volumes:
+      - ./bot:/app
+      - ./data:/app/data
+    env_file: ./bot/.env
+    environment:
+      - DATABASE_URL=postgresql://nutricoach:password@postgres:5432/nutricoach
+      - HERMES_API=http://hermes-coach:8081
+    command: >
+      sh -c "pip install -r /app/requirements.txt && python /app/main.py"
+    ports:
+      - "8080:8080"
+
+  # === 2. HERMES COACH (profil nutrition-coach) ===
+  hermes-coach:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes-nutrition
+    restart: unless-stopped
+    volumes:
+      - ./hermes-profile:/opt/data/profiles/nutrition-coach
+      - hermes-home:/opt/data
+    env_file: ./hermes-profile/.env
+    environment:
+      - HERMES_PROFILE=nutrition-coach
+    command: >
+      hermes chat --profile nutrition-coach --api-server --port 8081
+
+  # === 3. POSTGRESQL 16 ===
+  postgres:
+    image: postgres:16
+    container_name: nutrition-pg
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      POSTGRES_DB: nutricoach
+      POSTGRES_USER: nutricoach
+      POSTGRES_PASSWORD: "password"
+    ports:
+      - "127.0.0.1:5432:5432"
+
+volumes:
+  postgres-data:
+  hermes-home:
